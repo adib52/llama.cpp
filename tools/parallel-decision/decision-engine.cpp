@@ -175,7 +175,8 @@ struct decision_field {
 
 engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
     : ctx(ctx), vocab(llama_model_get_vocab(llama_get_model(ctx))), mem(llama_get_memory(ctx)),
-      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
+      seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1),
+      pad_branches(llama_model_is_recurrent(llama_get_model(ctx)) || llama_model_is_hybrid(llama_get_model(ctx))) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -236,15 +237,35 @@ bool engine::prepare_prefix(const tokens_t & shared, bool allow_cache) {
 
 // Score each branch as its own sequence forked from its trunk; return each branch's last-token
 // logits restricted to its candidate tokens. Groups are bounded by free sequences and batch rows.
+//
+// Recurrent layers take a ubatch only when every sequence in it holds the same number of tokens
+// (split_equal), so on recurrent/hybrid models uneven branches would split one decode into many
+// passes. There each group is right-padded to its longest branch (longest first, so padding stays
+// small). Every layer is causal, so the logits read at a branch's last real token don't see the
+// padding, and the padded cells are removed with the branch.
 std::vector<std::vector<float>> engine::score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free) {
     std::vector<std::vector<float>> result(branches.size());
+    std::vector<size_t> order(branches.size());
+    for (size_t b = 0; b < order.size(); ++b) {
+        order[b] = b;
+    }
+    if (pad_branches) {
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return branches[a].toks.size() > branches[b].toks.size();
+        });
+    }
     const int max_rows = (int) llama_n_batch(ctx);
     size_t start = 0;
-    while (start < branches.size()) {
+    while (start < order.size()) {
+        const int width = (int) branches[order[start]].toks.size(); // padded length of this group
         size_t end  = start;
         int    rows = 0;
-        while (end < branches.size() && (int) (end - start) < n_free && rows + (int) branches[end].toks.size() <= max_rows) {
-            rows += (int) branches[end].toks.size();
+        while (end < order.size() && (int) (end - start) < n_free) {
+            const int need = pad_branches ? width : (int) branches[order[end]].toks.size();
+            if (rows + need > max_rows) {
+                break;
+            }
+            rows += need;
             ++end;
         }
         if (end == start) {
@@ -252,17 +273,18 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
         }
         llama_batch batch = llama_batch_init(rows, 0, 1);
         std::vector<int> out_idx;
-        for (size_t b = start; b < end; ++b) {
-            const llama_seq_id seq = first + (llama_seq_id) (b - start);
+        for (size_t k = start; k < end; ++k) {
+            const auto &       br  = branches[order[k]];
+            const llama_seq_id seq = first + (llama_seq_id) (k - start);
             llama_memory_seq_rm(mem, seq, -1, -1);
-            llama_memory_seq_cp(mem, branches[b].trunk, seq, -1, -1);
-            const auto & toks = branches[b].toks;
-            for (size_t i = 0; i < toks.size(); ++i) {
-                const bool last = i + 1 == toks.size();
+            llama_memory_seq_cp(mem, br.trunk, seq, -1, -1);
+            const int n = pad_branches ? width : (int) br.toks.size();
+            for (int i = 0; i < n; ++i) {
+                const bool last = i + 1 == (int) br.toks.size();
                 if (last) {
                     out_idx.push_back(batch.n_tokens);
                 }
-                common_batch_add(batch, toks[i], branches[b].pos0 + (llama_pos) i, { seq }, last);
+                common_batch_add(batch, br.toks[std::min(i, (int) br.toks.size() - 1)], br.pos0 + (llama_pos) i, { seq }, last);
             }
         }
         const int rc = llama_decode(ctx, batch);
@@ -271,12 +293,12 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
             throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision branches"
                                              : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");
         }
-        for (size_t b = start; b < end; ++b) {
-            const float * logits = llama_get_logits_ith(ctx, out_idx[b - start]);
-            for (llama_token t : branches[b].cands) {
-                result[b].push_back(logits[t]);
+        for (size_t k = start; k < end; ++k) {
+            const float * logits = llama_get_logits_ith(ctx, out_idx[k - start]);
+            for (llama_token t : branches[order[k]].cands) {
+                result[order[k]].push_back(logits[t]);
             }
-            llama_memory_seq_rm(mem, first + (llama_seq_id) (b - start), -1, -1);
+            llama_memory_seq_rm(mem, first + (llama_seq_id) (k - start), -1, -1);
         }
         start = end;
     }

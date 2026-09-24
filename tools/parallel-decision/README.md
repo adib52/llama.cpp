@@ -54,8 +54,10 @@ decision-seqs = 12
 
 How many sequences a model affords depends on its attention. A plain-attention model shares the context's cells, so
 128 sequences cost almost nothing. A sliding-window model (Gemma) allocates its window per sequence, so keep it low
-(12 on a 12 GB card). Hybrid models with recurrent layers work, but llama.cpp splits their batches per sequence
-length, so branches run in several passes instead of one.
+(12 on a 12 GB card). Hybrid models with recurrent layers (Qwen3.5, Nemotron-H) keep a recurrent state per
+sequence (about 50 MB each for Qwen3.5 4B and 9B), and llama.cpp only batches their sequences together when they hold
+the same number of tokens. The engine right-pads each group of branches to its longest one, so they still score in a
+single pass; the padding comes after the token that is read, so it doesn't change the result.
 
 ## POST /v1/decision
 

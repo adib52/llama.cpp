@@ -100,6 +100,7 @@ class engine {
     llama_memory_t      mem;
     llama_seq_id        seq_snap, seq_pool;
     int                 n_pool;
+    bool                pad_branches; // recurrent/hybrid model: branches in a decode need equal lengths
     tokens_t            cached;
 
     tokens_t tokenize(const std::string & text, bool add_special) const;
